@@ -267,6 +267,19 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, citations,
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }]]}
         components={{
+          a({ children, href, ...props }: any) {
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-500 dark:text-blue-400 hover:underline"
+                {...props}
+              >
+                {children}
+              </a>
+            );
+          },
           h1({ children, ...props }: any) {
             return (
               <h1

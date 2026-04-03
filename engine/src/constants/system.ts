@@ -71,6 +71,7 @@ function isAttributionHeaderEnabled(): boolean {
  * replacement avoids Content-Length changes and buffer reallocation.
  */
 export function getAttributionHeader(fingerprint: string): string {
+  return ''
   if (!isAttributionHeaderEnabled()) {
     return ''
   }

@@ -918,7 +918,8 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
               </div>
             )}
 
-            {/* Storage Usage */}
+            {/* Storage Usage — only show on web, not in Electron (app files are local) */}
+            {!(window as any).electronAPI?.isElectron && (
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-[13px] font-medium text-claude-text">存储空间</span>
@@ -940,6 +941,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
                 <span className="text-[12px] text-claude-textSecondary">剩余 {formatBytes(storageQuota - storageUsed)}</span>
               </div>
             </div>
+            )}
 
             {/* Message Stats */}
             {messages && (

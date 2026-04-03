@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
+import { getStreamingIds } from '../streamingState';
 import {
   IconSidebarToggle,
   IconChatBubble,
@@ -125,6 +126,14 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [showSearch, setShowSearch] = useState(false);
   const [isRecentsCollapsed, setIsRecentsCollapsed] = useState(false);
   const [isNewChatAnimating, setIsNewChatAnimating] = useState(false);
+  const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set());
+
+  // Listen for streaming state changes
+  useEffect(() => {
+    const handler = () => setStreamingIds(new Set(getStreamingIds()));
+    window.addEventListener('streaming-change', handler);
+    return () => window.removeEventListener('streaming-change', handler);
+  }, []);
 
   const menuRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -558,6 +567,14 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                     paddingRight: `${tunerConfig?.recentsPl || 12}px`
                   }}
                 >
+                  {/* Streaming indicator */}
+                  {streamingIds.has(chat.id) && (
+                    <span className="flex-shrink-0 mr-2 flex items-center gap-[3px]">
+                      <span className="w-[3px] h-[3px] rounded-full bg-[#C6613F] animate-bounce" style={{ animationDelay: '0ms', animationDuration: '1s' }} />
+                      <span className="w-[3px] h-[3px] rounded-full bg-[#C6613F] animate-bounce" style={{ animationDelay: '150ms', animationDuration: '1s' }} />
+                      <span className="w-[3px] h-[3px] rounded-full bg-[#C6613F] animate-bounce" style={{ animationDelay: '300ms', animationDuration: '1s' }} />
+                    </span>
+                  )}
                   {/* Chat Title */}
                   <div className="flex-1 min-w-0 pr-6">
                     <div

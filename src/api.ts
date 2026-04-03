@@ -581,16 +581,117 @@ export async function getContextSize(conversationId: string): Promise<{ tokens: 
   return res.json();
 }
 
-// 手动压缩对话
+// 手动压缩对话 — delegates to engine's /compact command
 export async function compactConversation(
   id: string,
   instruction?: string
 ): Promise<{ summary: string; tokensSaved: number; messagesCompacted: number }> {
   const res = await request(`/conversations/${id}/compact`, {
     method: 'POST',
-    body: JSON.stringify({ instruction }),
+    body: JSON.stringify({
+      instruction,
+      env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
+      env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined,
+    }),
   });
   return res.json();
+}
+
+// 回答 AskUserQuestion — write control_response to engine stdin
+export async function answerUserQuestion(
+  conversationId: string,
+  requestId: string,
+  toolUseId: string,
+  answers: Record<string, string>
+): Promise<{ ok: boolean }> {
+  const res = await request(`/conversations/${conversationId}/answer`, {
+    method: 'POST',
+    body: JSON.stringify({ request_id: requestId, tool_use_id: toolUseId, answers }),
+  });
+  return res.json();
+}
+
+// Check if a conversation has an active engine stream
+export async function getStreamStatus(conversationId: string): Promise<{ active: boolean; eventCount: number }> {
+  const res = await request(`/conversations/${conversationId}/stream-status`);
+  return res.json();
+}
+
+// Reconnect to an active stream — receives buffered + live SSE events
+export function reconnectStream(
+  conversationId: string,
+  onDelta: (delta: string, full: string) => void,
+  onDone: (full: string) => void,
+  onError: (err: string) => void,
+  onThinking?: (thinking: string, full: string) => void,
+  onSystem?: (event: string, message: string, data: any) => void,
+  onToolUse?: (event: { type: 'start' | 'done'; tool_use_id: string; tool_name?: string; tool_input?: any; content?: string; is_error?: boolean }) => void,
+  signal?: AbortSignal
+): void {
+  let fullText = '';
+  let thinkingText = '';
+
+  fetch(`${API_BASE}/conversations/${conversationId}/reconnect`, { signal })
+    .then(async (res) => {
+      if (!res.ok || !res.body) { onError('Reconnect failed'); return; }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data.trim() === '[DONE]') { onDone(fullText); return; }
+
+          try {
+            const parsed = JSON.parse(data);
+
+            if (parsed.type === 'content_block_delta' && parsed.delta) {
+              if (parsed.delta.type === 'text_delta' && parsed.delta.text) {
+                fullText += parsed.delta.text;
+                onDelta(parsed.delta.text, fullText);
+              }
+              if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking && onThinking) {
+                thinkingText += parsed.delta.thinking;
+                onThinking(parsed.delta.thinking, thinkingText);
+              }
+            }
+            if (parsed.type === 'tool_use_start' && onToolUse) {
+              onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input });
+            }
+            if (parsed.type === 'tool_use_done' && onToolUse) {
+              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+            }
+            if (parsed.type === 'ask_user' && onSystem) {
+              onSystem('ask_user', '', parsed);
+            }
+            if (parsed.type === 'task_event' && onSystem) {
+              onSystem('task_event', '', parsed);
+            }
+            if (parsed.type === 'compact_boundary' && onSystem) {
+              onSystem('compact_boundary', '', parsed);
+            }
+            if (parsed.type === 'message_stop') {
+              if (fullText) { onDone(fullText); return; }
+            }
+            if (parsed.type === 'error') {
+              onError(parsed.error || 'Stream error');
+              return;
+            }
+          } catch (_) {}
+        }
+      }
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') onError(err.message || 'Reconnect failed');
+    });
 }
 
 // 删除指定消息及其后续消息
@@ -1067,6 +1168,30 @@ export async function sendMessage(
               // 新的 thinking block 开始
               thinkingText = '';
             }
+          }
+
+          // Handle compact_boundary from engine auto-compact
+          if (parsed.type === 'compact_boundary') {
+            if (onSystem) {
+              onSystem('compact_boundary', '', parsed);
+            }
+            continue;
+          }
+
+          // Handle AskUserQuestion from engine
+          if (parsed.type === 'ask_user') {
+            if (onSystem) {
+              onSystem('ask_user', '', parsed);
+            }
+            continue;
+          }
+
+          // Handle task/agent progress events
+          if (parsed.type === 'task_event') {
+            if (onSystem) {
+              onSystem('task_event', '', parsed);
+            }
+            continue;
           }
 
           // Handle tool use events

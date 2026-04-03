@@ -3,7 +3,8 @@ import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Papercl
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream } from '../api';
+import { addStreaming, removeStreaming, isStreaming } from '../streamingState';
 import MarkdownRenderer from './MarkdownRenderer';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import FileUploadPreview, { PendingFile } from './FileUploadPreview';
@@ -118,7 +119,9 @@ function isSearchStatusMessage(message: string) {
   return (
     message.startsWith('正在搜索：') ||
     message.startsWith('正在读取网页：') ||
-    message.startsWith('正在浏览 GitHub：')
+    message.startsWith('正在浏览 GitHub：') ||
+    message.startsWith('Searching:') ||
+    message.startsWith('Fetching:')
   );
 }
 
@@ -419,14 +422,14 @@ const MessageList = React.memo<MessageListProps>(({
       `}</style>
       {messages.map((msg: any, idx: number) => (
         <div key={idx} className="mb-6 group">
-          {msg.is_summary === 1 && (
+          {(msg.is_summary === 1 || msg.is_compact_boundary) && (
             <div className="flex items-center gap-3 mb-5 mt-2">
               <div className="flex-1 h-px bg-claude-border" />
               <span className="text-[12px] text-claude-textSecondary whitespace-nowrap">Context compacted above this point</span>
               <div className="flex-1 h-px bg-claude-border" />
             </div>
           )}
-          {msg.is_summary === 1 ? null : msg.role === 'user' ? (
+          {(msg.is_summary === 1 || msg.is_compact_boundary) ? null : msg.role === 'user' ? (
             editingMessageIdx === idx ? (
               <div className="w-full bg-[#F0EEE7] dark:bg-claude-btnHover rounded-xl p-3 border border-black/5 dark:border-white/10">
                 <div className="bg-white dark:bg-black/20 rounded-lg border border-black/10 dark:border-white/10 focus-within:ring-2 focus-within:ring-blue-500/20 focus-within:border-blue-500 transition-all p-3">
@@ -610,9 +613,12 @@ const MessageList = React.memo<MessageListProps>(({
               )}
               {/* Tool calls display */}
               {msg.toolCalls && msg.toolCalls.length > 0 && (() => {
+                const FRONTEND_HIDDEN = new Set(['WebSearch', 'WebFetch']);
+                const visibleToolCalls = msg.toolCalls.filter((tc: any) => !FRONTEND_HIDDEN.has(tc.name));
+                if (visibleToolCalls.length === 0) return null;
                 const isStale = (!loading && idx === messages.length - 1) || (idx < messages.length - 1) || !!msg.content;
 
-                const toolNames = msg.toolCalls.map((tc: any) => {
+                const toolNames = visibleToolCalls.map((tc: any) => {
                   const nameMap: Record<string, string> = {
                     'Read': 'Read file', 'Write': 'Write file', 'Edit': 'Edit file',
                     'Bash': 'Run command', 'ListDir': 'List directory',
@@ -621,17 +627,18 @@ const MessageList = React.memo<MessageListProps>(({
                   return nameMap[tc.name] || tc.name;
                 });
                 const uniqueNames = [...new Set(toolNames)];
-                const allDone = msg.toolCalls.every((tc: any) => {
+                const allDone = visibleToolCalls.every((tc: any) => {
                   const rs = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
                   return rs !== 'running';
                 });
-                const hasError = msg.toolCalls.some((tc: any) => tc.status === 'error');
+                const hasError = visibleToolCalls.some((tc: any) => tc.status === 'error');
                 const summary = uniqueNames.join(', ');
 
                 return (
                   <div className="mb-4">
+                    <div className={`rounded-lg overflow-hidden ${!allDone ? 'bg-black/[0.04] dark:bg-white/[0.04]' : ''}`}>
                     <div
-                      className="flex items-center gap-2 cursor-pointer select-none group/tool text-claude-textSecondary hover:text-claude-text transition-colors"
+                      className="flex items-center gap-2 cursor-pointer select-none group/tool text-claude-textSecondary hover:text-claude-text transition-colors px-2 py-1.5"
                       onClick={() => {
                         onSetMessages(prev =>
                           prev.map((m, i) =>
@@ -654,10 +661,11 @@ const MessageList = React.memo<MessageListProps>(({
                       </span>
                       <ChevronDown size={14} className={`transform transition-transform duration-200 ${msg.isToolCallsExpanded ? 'rotate-180' : ''}`} />
                     </div>
+                    </div>
 
                     {msg.isToolCallsExpanded && (
                       <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border space-y-3">
-                        {msg.toolCalls.map((tc: any, tcIdx: number) => {
+                        {visibleToolCalls.map((tc: any, tcIdx: number) => {
                           const inputStr = tc.input ? (typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)) : '';
                           const inputPreview = tc.input?.file_path || tc.input?.command || tc.input?.path || (inputStr.length > 80 ? inputStr.slice(0, 80) + '...' : inputStr);
                           const realStatus = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
@@ -698,7 +706,7 @@ const MessageList = React.memo<MessageListProps>(({
                                       {stats.removed > 0 && <span className="text-red-500 dark:text-red-400">-{stats.removed}</span>}
                                     </span>
                                   )}
-                                  {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-pulse">Running...</span>}
+                                  {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-shimmer-text">Running...</span>}
                                   {realStatus === 'error' && <span className="text-red-400/80 text-[12px]">Failed</span>}
                                   {realStatus !== 'running' && expandable && (
                                     <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${(tc.isExpanded ?? false) ? 'rotate-180' : ''}`} />
@@ -899,6 +907,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const streamConversationIdRef = useRef<string | null>(null);
   const streamRequestIdRef = useRef(0);
 
+  // Per-conversation message buffer for multi-conversation streaming isolation
+  const viewingIdRef = useRef<string | null>(null);
+  const messagesBufferRef = useRef(new Map<string, any[]>());
+
+  // Update messages for a specific conversation — only touches React state if it's the active conversation
+  const setMessagesFor = useCallback((convId: string, updater: (prev: any[]) => any[]) => {
+    if (viewingIdRef.current === convId) {
+      setMessages(prev => {
+        const result = updater(prev);
+        messagesBufferRef.current.set(convId, result);
+        return result;
+      });
+    } else {
+      const prev = messagesBufferRef.current.get(convId) || [];
+      messagesBufferRef.current.set(convId, updater(prev));
+    }
+  }, []);
+
   const isModelSelectable = useCallback((modelString: string) => {
     const base = stripThinking(modelString);
     const pool = modelCatalog?.all || displayCommonModels;
@@ -944,8 +970,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   const [compactStatus, setCompactStatus] = useState<{ state: 'idle' | 'compacting' | 'done' | 'error'; message?: string }>({ state: 'idle' });
+  const [showCompactDialog, setShowCompactDialog] = useState(false);
+  const [compactInstruction, setCompactInstruction] = useState('');
   const [hasSubscription, setHasSubscription] = useState<boolean | null>(null); // null = loading
   const [contextInfo, setContextInfo] = useState<{ tokens: number; limit: number } | null>(null);
+
+  // AskUserQuestion state
+  const [askUserDialog, setAskUserDialog] = useState<{
+    request_id: string;
+    tool_use_id: string;
+    questions: Array<{ question: string; header?: string; options?: Array<{ label: string; description?: string }>; multiSelect?: boolean }>;
+    answers: Record<string, string>;
+  } | null>(null);
+
+  // Task/Agent progress state
+  const [activeTasks, setActiveTasks] = useState<Map<string, { description: string; status?: string; summary?: string; last_tool_name?: string }>>(new Map());
+
+  // Plan mode state
+  const [planMode, setPlanMode] = useState(false);
 
   // 草稿持久化 refs（跟踪最新值，供 effect cleanup 读取）
   const inputTextRef = useRef(inputText);
@@ -1134,20 +1176,122 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, [activeId]);
 
   useEffect(() => {
-    // 只在会话 ID 真正变化时重新加载对话，避免模型列表/默认模型变化时把流式中的 messages 覆盖掉
-    if (activeId && !isCreatingRef.current) {
-      loadConversation(activeId);
+    // Reset state when switching conversations — each conversation has independent streaming
+    setPlanMode(false);
+    setActiveTasks(new Map());
+    setAskUserDialog(null);
+    isCreatingRef.current = false;
+    viewingIdRef.current = activeId || null;
+
+    if (activeId) {
+      // Check if there's a live buffer for this conversation (e.g. streaming in background)
+      const buffered = messagesBufferRef.current.get(activeId);
+      if (buffered && buffered.length > 0) {
+        setMessages(buffered);
+        setLoading(isStreaming(activeId));
+      } else {
+        setLoading(false);
+        loadConversation(activeId);
+        // Check if server has an active stream we can reconnect to
+        const convId = activeId;
+        getStreamStatus(convId).then(status => {
+          if (status.active && viewingIdRef.current === convId) {
+            setLoading(true);
+            addStreaming(convId);
+            // Seed buffer from current messages + placeholder
+            setMessages(prev => {
+              const msgs = prev.length > 0 ? prev : [];
+              // Add assistant placeholder if last message isn't one
+              if (msgs.length === 0 || msgs[msgs.length - 1].role !== 'assistant') {
+                const withPlaceholder = [...msgs, { role: 'assistant', content: '' }];
+                messagesBufferRef.current.set(convId, withPlaceholder);
+                return withPlaceholder;
+              }
+              messagesBufferRef.current.set(convId, msgs);
+              return msgs;
+            });
+            const reconnectController = new AbortController();
+            abortControllerRef.current = reconnectController;
+            reconnectStream(
+              convId,
+              (delta, full) => {
+                setMessagesFor(convId, prev => {
+                  const newMsgs = [...prev];
+                  const lastMsg = newMsgs[newMsgs.length - 1];
+                  if (lastMsg && lastMsg.role === 'assistant') { lastMsg.content = full; lastMsg.isThinking = false; }
+                  return newMsgs;
+                });
+              },
+              (full) => {
+                removeStreaming(convId);
+                messagesBufferRef.current.delete(convId);
+                if (viewingIdRef.current === convId) setLoading(false);
+                abortControllerRef.current = null;
+                setMessagesFor(convId, prev => {
+                  const newMsgs = [...prev];
+                  const lastMsg = newMsgs[newMsgs.length - 1];
+                  if (lastMsg && lastMsg.role === 'assistant') { lastMsg.content = full; lastMsg.isThinking = false; }
+                  return newMsgs;
+                });
+              },
+              (err) => {
+                removeStreaming(convId);
+                messagesBufferRef.current.delete(convId);
+                if (viewingIdRef.current === convId) setLoading(false);
+                abortControllerRef.current = null;
+              },
+              (thinkingDelta, thinkingFull) => {
+                setMessagesFor(convId, prev => {
+                  const newMsgs = [...prev];
+                  const lastMsg = newMsgs[newMsgs.length - 1];
+                  if (lastMsg && lastMsg.role === 'assistant') { lastMsg.thinking = thinkingFull; lastMsg.isThinking = true; }
+                  return newMsgs;
+                });
+              },
+              (event, message, data) => {
+                if (event === 'ask_user' && data) {
+                  setAskUserDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, questions: data.questions || [], answers: {} });
+                }
+                if (event === 'task_event' && data) {
+                  setActiveTasks(prev => {
+                    const next = new Map(prev);
+                    if (data.subtype === 'task_started') next.set(data.task_id, { description: data.description || 'Running task...' });
+                    else if (data.subtype === 'task_progress') { const e = next.get(data.task_id); if (e) next.set(data.task_id, { ...e, last_tool_name: data.last_tool_name }); }
+                    else if (data.subtype === 'task_notification') next.delete(data.task_id);
+                    return next;
+                  });
+                }
+              },
+              (toolEvent) => {
+                if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+                if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+                const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
+                if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+                setMessagesFor(convId, prev => {
+                  const newMsgs = [...prev];
+                  const lastMsg = newMsgs[newMsgs.length - 1];
+                  if (!lastMsg || lastMsg.role !== 'assistant') return prev;
+                  const toolCalls = lastMsg.toolCalls || [];
+                  if (toolEvent.type === 'start') toolCalls.push({ id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: toolEvent.tool_input, status: 'running' as const });
+                  else if (toolEvent.type === 'done') { const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id); if (tc) { tc.status = toolEvent.is_error ? 'error' as const : 'done' as const; tc.result = toolEvent.content; } }
+                  lastMsg.toolCalls = toolCalls;
+                  return newMsgs;
+                });
+              },
+              reconnectController.signal
+            );
+          }
+        }).catch(() => {});
+      }
       getContextSize(activeId).then(setContextInfo).catch(() => { });
       isAtBottomRef.current = true;
       return;
     }
 
-    if (!activeId) {
-      setMessages([]);
-      setContextInfo(null);
-      // Default model for new chat
-      setCurrentModelString(resolveModelForNewChat());
-    }
+    setLoading(false);
+    setMessages([]);
+    setContextInfo(null);
+    setCurrentModelString(resolveModelForNewChat());
   }, [activeId]);
 
   const stopPolling = useCallback(() => {
@@ -1544,11 +1688,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       }
     }
 
-    // Call streaming API
+    // Call streaming API — seed buffer with current messages so background streaming works
+    messagesBufferRef.current.set(conversationId!, [...messages, tempUserMsg, { role: 'assistant', content: '' }]);
     const controller = new AbortController();
     const streamRequestId = beginStreamSession(conversationId!);
     abortControllerRef.current = controller;
     setLoading(true);
+    addStreaming(conversationId!);
     activeRequestCountRef.current += 1;
     await sendMessage(
       conversationId!,
@@ -1556,7 +1702,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       attachmentsPayload,
       (delta, full) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -1568,12 +1714,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setLoading(false);
+        removeStreaming(conversationId!);
+        messagesBufferRef.current.delete(conversationId!);
+        if (viewingIdRef.current === conversationId) setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         isCreatingRef.current = false; // Reset flag
         clearStreamSession(conversationId!, streamRequestId);
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -1610,12 +1758,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (err) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setLoading(false);
+        removeStreaming(conversationId!);
+        messagesBufferRef.current.delete(conversationId!);
+        if (viewingIdRef.current === conversationId) setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         isCreatingRef.current = false;
         clearStreamSession(conversationId!, streamRequestId);
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
             newMsgs[newMsgs.length - 1].content = formatChatError(err);
@@ -1626,8 +1776,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (thinkingDelta, thinkingFull) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        // Handle thinking updates
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -1654,7 +1803,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         // Handle system/status events (e.g. web search status)
         if (event === 'status' && message) {
           if (!isSearchStatusMessage(message)) return;
-          setMessages(prev => {
+          setMessagesFor(conversationId!, prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
             if (lastMsg && lastMsg.role === 'assistant') {
@@ -1687,14 +1836,53 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             setCompactStatus({ state: 'idle' });
           }
         }
+        // Handle compact_boundary from engine auto-compact during normal chat
+        if (event === 'compact_boundary') {
+          const meta = data?.compact_metadata || {};
+          const preTokens = meta.pre_tokens || 0;
+          const saved = preTokens ? Math.round(preTokens * 0.7) : 0;
+          setCompactStatus({ state: 'done', message: saved > 0 ? `Auto-compacted, saved ~${saved} tokens` : 'Context auto-compacted' });
+          setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
+          // Reload messages to reflect compacted state
+          if (activeId) {
+            loadConversation(activeId);
+            getContextSize(activeId).then(setContextInfo).catch(() => {});
+          }
+        }
         if (event === 'context_size' && data) {
           setContextInfo({ tokens: data.tokens, limit: data.limit });
+        }
+        // AskUserQuestion — engine needs user input
+        if (event === 'ask_user' && data) {
+          setAskUserDialog({
+            request_id: data.request_id,
+            tool_use_id: data.tool_use_id,
+            questions: data.questions || [],
+            answers: {},
+          });
+        }
+        // Task/Agent progress
+        if (event === 'task_event' && data) {
+          setActiveTasks(prev => {
+            const next = new Map(prev);
+            if (data.subtype === 'task_started') {
+              next.set(data.task_id, { description: data.description || 'Running task...' });
+            } else if (data.subtype === 'task_progress') {
+              const existing = next.get(data.task_id);
+              if (existing) {
+                next.set(data.task_id, { ...existing, last_tool_name: data.last_tool_name, summary: data.summary });
+              }
+            } else if (data.subtype === 'task_notification') {
+              next.delete(data.task_id);
+            }
+            return next;
+          });
         }
       },
       (sources, query, tokens) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle search_sources — collect citation sources
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -1731,8 +1919,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (doc) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        // Handle document_created — store document on the assistant message
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -1743,7 +1930,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (draft) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -1821,7 +2008,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       // Handle tool use events from SDK
       (toolEvent) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setMessages(prev => {
+
+        // Track plan mode from tool events
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+
+        // Don't add internal tools to UI tool list
+        const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
+        if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+
+        setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (!lastMsg || lastMsg.role !== 'assistant') return prev;
@@ -1878,6 +2074,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   // 停止生成（双模式：SSE 直连 or 轮询模式）
   const handleStop = () => {
     if (abortStreamSession(activeId || undefined)) {
+      if (activeId) removeStreaming(activeId);
       return;
     }
     if (pollingRef.current && activeId) {
@@ -1885,6 +2082,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       stopGeneration(activeId).catch(e => console.error('[Stop] error:', e));
       stopPolling();
     }
+    if (activeId) removeStreaming(activeId);
     setLoading(false);
     isCreatingRef.current = false;
   };
@@ -1965,6 +2163,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const streamRequestId = beginStreamSession(conversationId);
     abortControllerRef.current = controller;
     setLoading(true);
+    addStreaming(conversationId);
     activeRequestCountRef.current += 1;
     await sendMessage(
       conversationId,
@@ -1972,7 +2171,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       attachmentsPayload,
       (delta, full) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -1984,11 +2183,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setLoading(false);
+        removeStreaming(conversationId);
+        messagesBufferRef.current.delete(conversationId);
+        if (viewingIdRef.current === conversationId) setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -2001,6 +2202,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       (err) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
+        removeStreaming(conversationId);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -2015,7 +2217,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (thinkingDelta, thinkingFull) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -2029,7 +2231,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         if (event === 'metadata' && data && data.user_message_id) {
-          setMessages(prev => {
+          setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
             const userIdx = newMsgs.length - 2;
             if (userIdx >= 0 && newMsgs[userIdx].role === 'user') {
@@ -2039,7 +2241,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
         if (event === 'thinking_summary' && message) {
-          setMessages(prev => {
+          setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
             if (lastMsg && lastMsg.role === 'assistant') {
@@ -2055,7 +2257,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       undefined,
       (doc) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -2066,7 +2268,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (draft) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -2148,6 +2350,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const streamRequestId = beginStreamSession(conversationId);
     abortControllerRef.current = controller;
     setLoading(true);
+    addStreaming(conversationId);
     activeRequestCountRef.current += 1;
     await sendMessage(
       conversationId,
@@ -2155,7 +2358,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       attachmentsPayload,
       (delta, full) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -2167,11 +2370,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setLoading(false);
+        removeStreaming(conversationId);
+        messagesBufferRef.current.delete(conversationId);
+        if (viewingIdRef.current === conversationId) setLoading(false);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -2184,6 +2389,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       (err) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         setLoading(false);
+        removeStreaming(conversationId);
         activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -2198,7 +2404,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (thinkingDelta, thinkingFull) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
@@ -2212,7 +2418,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
         if (event === 'metadata' && data && data.user_message_id) {
-          setMessages(prev => {
+          setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
             const userIdx = newMsgs.length - 2;
             if (userIdx >= 0 && newMsgs[userIdx].role === 'user') {
@@ -2222,7 +2428,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
         if (event === 'thinking_summary' && message) {
-          setMessages(prev => {
+          setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
             const lastMsg = newMsgs[newMsgs.length - 1];
             if (lastMsg && lastMsg.role === 'assistant') {
@@ -2238,7 +2444,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       undefined,
       (doc) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -2249,7 +2455,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (draft) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
-        setMessages(prev => {
+        setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastIdx = newMsgs.length - 1;
           if (newMsgs[lastIdx] && newMsgs[lastIdx].role === 'assistant') {
@@ -2628,23 +2834,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                           Add files or photos
                         </button>
                         <button
-                          onClick={async () => {
+                          onClick={() => {
                             setShowPlusMenu(false);
                             if (!activeId || compactStatus.state === 'compacting') return;
-                            setCompactStatus({ state: 'compacting' });
-                            try {
-                              const result = await compactConversation(activeId);
-                              await loadConversation(activeId);
-                              // 更新 context size
-                              const newContextInfo = await getContextSize(activeId);
-                              setContextInfo(newContextInfo);
-                              setCompactStatus({ state: 'done', message: `Compacted ${result.messagesCompacted} messages, saved ~${result.tokensSaved} tokens` });
-                              setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
-                            } catch (err) {
-                              console.error('Compact failed:', err);
-                              setCompactStatus({ state: 'error', message: 'Compaction failed' });
-                              setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
-                            }
+                            setCompactInstruction('');
+                            setShowCompactDialog(true);
                           }}
                           className="w-full flex items-center gap-3 px-4 py-2.5 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                         >
@@ -2727,6 +2921,161 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           </div>
         </div>
       </div>
+
+      {/* Plan mode banner */}
+      {planMode && (
+        <div className="fixed top-0 left-0 right-0 z-[100] flex items-center justify-center pointer-events-none" style={{ paddingLeft: 'var(--sidebar-width, 260px)' }}>
+          <div className="mt-2 px-4 py-1.5 bg-amber-500/90 text-white text-[13px] font-medium rounded-full shadow-lg pointer-events-auto flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            Plan Mode — Claude is planning, not executing
+          </div>
+        </div>
+      )}
+
+      {/* Active tasks progress */}
+      {activeTasks.size > 0 && (
+        <div className="fixed bottom-[140px] right-6 z-[90] flex flex-col gap-1.5 max-w-[320px]">
+          {Array.from(activeTasks.entries()).map(([taskId, task]) => (
+            <div key={taskId} className="bg-claude-bg border border-claude-border rounded-lg px-3 py-2 shadow-lg flex items-center gap-2 text-[12px] text-claude-textSecondary animate-pulse">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin flex-shrink-0"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+              <span className="truncate">{task.last_tool_name ? `${task.description} (${task.last_tool_name})` : task.description}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* AskUserQuestion dialog */}
+      {askUserDialog && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40">
+          <div className="bg-claude-bg border border-claude-border rounded-2xl shadow-xl w-[480px] max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3">
+              <h3 className="text-[15px] font-semibold text-claude-text mb-1 flex items-center gap-2">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                Claude needs your input
+              </h3>
+            </div>
+            <div className="px-5 pb-4 flex flex-col gap-4">
+              {askUserDialog.questions.map((q, qi) => (
+                <div key={qi} className="flex flex-col gap-1.5">
+                  <label className="text-[13px] font-medium text-claude-text">{q.question}</label>
+                  {q.options && q.options.length > 0 ? (
+                    <div className="flex flex-col gap-1">
+                      {q.options.map((opt, oi) => {
+                        const selected = askUserDialog.answers[q.question] === opt.label;
+                        return (
+                          <button
+                            key={oi}
+                            onClick={() => setAskUserDialog(prev => prev ? { ...prev, answers: { ...prev.answers, [q.question]: opt.label } } : null)}
+                            className={`text-left px-3 py-2 rounded-lg border text-[13px] transition-colors ${selected ? 'border-[#C6613F] bg-[#C6613F]/10 text-claude-text' : 'border-claude-border hover:bg-claude-hover text-claude-textSecondary'}`}
+                          >
+                            <div className="font-medium text-claude-text">{opt.label}</div>
+                            {opt.description && <div className="text-[12px] text-claude-textSecondary mt-0.5">{opt.description}</div>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      className="w-full bg-claude-input border border-claude-border rounded-lg px-3 py-2 text-[13px] text-claude-text outline-none focus:border-claude-textSecondary/40 transition-colors"
+                      placeholder="Type your answer..."
+                      value={askUserDialog.answers[q.question] || ''}
+                      onChange={e => setAskUserDialog(prev => prev ? { ...prev, answers: { ...prev.answers, [q.question]: e.target.value } } : null)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          document.getElementById('ask-user-submit-btn')?.click();
+                        }
+                      }}
+                      autoFocus={qi === 0}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center justify-end gap-2 px-5 pb-4">
+              <button
+                id="ask-user-submit-btn"
+                onClick={async () => {
+                  if (!askUserDialog || !activeId) return;
+                  const { request_id, tool_use_id, answers } = askUserDialog;
+                  setAskUserDialog(null);
+                  try {
+                    await answerUserQuestion(activeId, request_id, tool_use_id, answers);
+                  } catch (err) {
+                    console.error('Failed to send answer:', err);
+                  }
+                }}
+                className="px-4 py-1.5 text-[13px] text-white bg-[#C6613F] hover:bg-[#D97757] rounded-lg transition-colors font-medium"
+              >
+                Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Compact conversation dialog */}
+      {showCompactDialog && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40" onClick={() => setShowCompactDialog(false)}>
+          <div className="bg-claude-bg border border-claude-border rounded-2xl shadow-xl w-[440px] overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3">
+              <h3 className="text-[15px] font-semibold text-claude-text mb-1">Compact conversation</h3>
+              <p className="text-[13px] text-claude-textSecondary leading-snug">
+                Summarize the conversation history to free up context space. The engine will preserve key decisions and context.
+              </p>
+            </div>
+            <div className="px-5 pb-3">
+              <textarea
+                className="w-full bg-claude-input border border-claude-border rounded-lg px-3 py-2 text-[13px] text-claude-text placeholder:text-claude-textSecondary/50 outline-none focus:border-claude-textSecondary/40 transition-colors resize-none"
+                rows={3}
+                placeholder="Optional: add instructions for the summary (e.g. 'preserve all API endpoint details')"
+                value={compactInstruction}
+                onChange={e => setCompactInstruction(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    document.getElementById('compact-confirm-btn')?.click();
+                  }
+                }}
+                autoFocus
+              />
+            </div>
+            <div className="flex items-center justify-end gap-2 px-5 pb-4">
+              <button
+                onClick={() => setShowCompactDialog(false)}
+                className="px-3.5 py-1.5 text-[13px] text-claude-textSecondary hover:text-claude-text rounded-lg hover:bg-claude-hover transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                id="compact-confirm-btn"
+                onClick={async () => {
+                  setShowCompactDialog(false);
+                  if (!activeId || compactStatus.state === 'compacting') return;
+                  setCompactStatus({ state: 'compacting' });
+                  try {
+                    const instruction = compactInstruction.trim() || undefined;
+                    const result = await compactConversation(activeId, instruction);
+                    await loadConversation(activeId);
+                    const newContextInfo = await getContextSize(activeId);
+                    setContextInfo(newContextInfo);
+                    setCompactStatus({ state: 'done', message: `Compacted ${result.messagesCompacted} messages, saved ~${result.tokensSaved} tokens` });
+                    setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
+                  } catch (err) {
+                    console.error('Compact failed:', err);
+                    setCompactStatus({ state: 'error', message: 'Compaction failed' });
+                    setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
+                  }
+                }}
+                className="px-3.5 py-1.5 text-[13px] text-white bg-[#C6613F] hover:bg-[#D97757] rounded-lg transition-colors font-medium"
+              >
+                Compact
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

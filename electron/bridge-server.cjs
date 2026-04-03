@@ -32,6 +32,42 @@ function initServer(mainWindow) {
     server.use(cors());
     server.use(express.json());
 
+    // Track active engine child processes per conversation (for stdin writes like AskUserQuestion)
+    const activeChildren = new Map();
+
+    // Per-conversation stream state: buffer events so frontend can reconnect mid-stream
+    // Key: conversationId, Value: { events: [], listeners: Set<res>, done: boolean }
+    const activeStreams = new Map();
+
+    function broadcastSSE(conversationId, event) {
+        const stream = activeStreams.get(conversationId);
+        if (!stream) return;
+        stream.events.push(event);
+        const line = 'data: ' + JSON.stringify(event) + '\n\n';
+        var arr = Array.from(stream.listeners);
+        for (var i = 0; i < arr.length; i++) {
+            try { arr[i].write(line); } catch (_) { stream.listeners.delete(arr[i]); }
+        }
+    }
+
+    function endStream(conversationId) {
+        const stream = activeStreams.get(conversationId);
+        if (!stream) return;
+        stream.done = true;
+        // End the primary POST response
+        if (stream.primaryRes) {
+            try { stream.primaryRes.write('data: [DONE]\n\n'); stream.primaryRes.end(); } catch (_) {}
+            stream.primaryRes = null;
+        }
+        // End all reconnect listeners
+        for (const r of stream.listeners) {
+            try { r.write('data: [DONE]\n\n'); r.end(); } catch (_) {}
+        }
+        stream.listeners.clear();
+        // Keep buffer for 30s so frontend can still reconnect after slight delay
+        setTimeout(() => { if (activeStreams.get(conversationId) === stream) activeStreams.delete(conversationId); }, 30000);
+    }
+
     // Setup paths
     const userDataPath = app.getPath('userData');
     const dbPath = path.join(userDataPath, 'claude-desktop.json');
@@ -544,80 +580,203 @@ function initServer(mainWindow) {
         res.status(404).json({ error: 'File not found' });
     });
 
-    // Compact conversation — summarize history to reduce context size
+    // Compact conversation — delegates to Claude Code engine's /compact command
     server.post('/api/conversations/:id/compact', async (req, res) => {
         const conv = db.conversations.find(c => c.id === req.params.id);
         if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
-        const convMessages = db.messages
-            .filter(m => m.conversation_id === req.params.id)
-            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-        if (convMessages.length < 3) {
-            return res.status(400).json({ error: 'Not enough messages to compact' });
+        if (!conv.claude_session_id) {
+            return res.status(400).json({ error: 'No engine session to compact (conversation has no history in engine)' });
         }
 
         const env_token = req.body.env_token;
         const env_base_url = req.body.env_base_url;
+        const instruction = req.body.instruction || '';
         const apiKey = env_token || engineEnvVars.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
-        const baseUrl = env_base_url || engineEnvVars.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL;
+        const baseUrl = engineEnvVars.ANTHROPIC_BASE_URL || env_base_url || process.env.ANTHROPIC_BASE_URL;
+        const modelId = (conv.model || 'claude-sonnet-4-6').replace(/-thinking$/, '');
+
+        // Count messages before compaction for reporting
+        const messagesBeforeCompact = db.messages.filter(m => m.conversation_id === req.params.id).length;
 
         try {
-            // Build a text summary of the conversation for the compaction prompt
-            let historyText = '';
-            for (const m of convMessages) {
-                const parsed = JSON.parse(m.content || '[]');
-                const text = parsed.map(b => b.text || '').join('').slice(0, 500);
-                historyText += `[${m.role}]: ${text}\n`;
-            }
-            historyText = historyText.slice(0, 20000); // Cap at ~5K tokens
+            // Spawn engine CLI with /compact as the prompt — engine handles the full compaction internally
+            const compactPrompt = instruction ? `/compact ${instruction}` : '/compact';
+            const cliArgs = [
+                '--preload', enginePreload,
+                '--env-file=' + engineEnv, engineCli,
+                '-p', compactPrompt,
+                '--output-format', 'stream-json',
+                '--verbose',
+                '--permission-mode', 'bypassPermissions',
+                '--model', modelId,
+                '--resume', conv.claude_session_id,
+            ];
 
-            let modelId = (conv.model || 'claude-sonnet-4-6').replace(/-thinking$/, '');
-            let endpoint = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/v1/messages` : 'https://api.anthropic.com/v1/messages';
-            if (baseUrl && baseUrl.replace(/\/+$/, '').endsWith('/v1')) endpoint = `${baseUrl.replace(/\/+$/, '')}/messages`;
+            const envVars = Object.assign({}, process.env);
+            if (apiKey) envVars.ANTHROPIC_API_KEY = apiKey;
+            if (baseUrl) envVars.ANTHROPIC_BASE_URL = baseUrl;
 
-            const response = await fetch(endpoint, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-                body: JSON.stringify({
-                    model: modelId,
-                    max_tokens: 2000,
-                    system: 'You are a conversation summarizer. Summarize the following conversation history concisely, preserving key decisions, code changes, and context needed to continue the conversation. Respond in the same language as the conversation.',
-                    messages: [{ role: 'user', content: historyText }]
-                })
+            console.log('[Compact] Spawning engine /compact, session=' + conv.claude_session_id + ' model=' + modelId);
+
+            const child = spawn(bunExePath, cliArgs, {
+                cwd: conv.workspace_path, env: envVars,
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            child.stdin.end();
+
+            let compactSummary = '';
+            let compactMetadata = null;
+            let buf = '';
+
+            child.stdout.on('data', (chunk) => {
+                buf += chunk.toString('utf8');
+                const lines = buf.split('\n');
+                buf = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    let evt;
+                    try { evt = JSON.parse(line); } catch { continue; }
+
+                    // Capture the compact_boundary event from engine
+                    if (evt.type === 'system' && evt.subtype === 'compact_boundary') {
+                        compactMetadata = evt.compact_metadata || {};
+                        console.log('[Compact] Engine compact_boundary:', JSON.stringify(compactMetadata));
+                    }
+                    // Capture any text output (the compact summary display)
+                    if (evt.type === 'assistant' && evt.message && evt.message.content) {
+                        for (const block of evt.message.content) {
+                            if (block.type === 'text' && block.text) {
+                                compactSummary += block.text;
+                            }
+                        }
+                    }
+                    // Also capture from stream events
+                    if (evt.type === 'stream_event' && evt.event) {
+                        const se = evt.event;
+                        if (se.type === 'content_block_delta' && se.delta && se.delta.type === 'text_delta') {
+                            compactSummary += se.delta.text;
+                        }
+                    }
+                    // Result fallback
+                    if (evt.type === 'result' && evt.result && !compactSummary) {
+                        compactSummary = typeof evt.result === 'string' ? evt.result : '';
+                    }
+                }
             });
 
-            let compactSummary = 'Conversation compacted.';
-            if (response.ok) {
-                const data = await response.json();
-                const textBlock = (data.content || []).find(b => b.type === 'text');
-                if (textBlock?.text) compactSummary = textBlock.text;
-            }
+            let stderrBuf = '';
+            child.stderr.on('data', (c) => { stderrBuf += c.toString('utf8'); });
 
-            const messagesCompacted = convMessages.length;
-            const totalChars = convMessages.reduce((sum, m) => sum + (m.content || '').length + (m.thinking || '').length, 0);
-            const tokensSaved = Math.round(totalChars / 4 * 0.7);
+            await new Promise((resolve, reject) => {
+                child.on('close', (code) => {
+                    // Process remaining buffer
+                    if (buf.trim()) {
+                        try {
+                            const e = JSON.parse(buf);
+                            if (e.type === 'system' && e.subtype === 'compact_boundary') {
+                                compactMetadata = e.compact_metadata || {};
+                            }
+                            if (!compactSummary && e.result) compactSummary = typeof e.result === 'string' ? e.result : '';
+                        } catch (_) {}
+                    }
+                    if (code !== 0 && !compactMetadata) {
+                        reject(new Error(stderrBuf || 'Engine compact failed with exit code ' + code));
+                    } else {
+                        resolve();
+                    }
+                });
+                child.on('error', reject);
+            });
 
-            // Replace all old messages with the summary
-            db.messages = db.messages.filter(m => m.conversation_id !== req.params.id);
+            // Engine has compacted its internal session — keep all old messages
+            // in local db for UI display, just append a compact boundary marker
+            const tokensSaved = compactMetadata && compactMetadata.pre_tokens
+                ? Math.round(compactMetadata.pre_tokens * 0.7)
+                : Math.round(messagesBeforeCompact * 500); // rough estimate
+
             db.messages.push({
                 id: uuidv4(),
                 conversation_id: req.params.id,
-                role: 'assistant',
-                content: JSON.stringify([{ type: 'text', text: compactSummary }]),
+                role: 'system',
+                content: JSON.stringify([{ type: 'text', text: compactSummary || 'Conversation compacted.' }]),
                 created_at: new Date().toISOString(),
-                is_summary: 1,
+                is_compact_boundary: true,
             });
-            // Also clear the API history file
-            const historyPath = path.join(conv.workspace_path, '.api_history.json');
-            if (fs.existsSync(historyPath)) fs.unlinkSync(historyPath);
             saveDb();
 
-            console.log(`[Compact] Done: ${messagesCompacted} messages compacted, ~${tokensSaved} tokens saved`);
-            res.json({ summary: compactSummary, tokensSaved, messagesCompacted });
+            console.log(`[Compact] Done: ${messagesBeforeCompact} messages compacted, ~${tokensSaved} tokens saved`);
+            res.json({ summary: compactSummary || 'Conversation compacted.', tokensSaved, messagesCompacted: messagesBeforeCompact });
         } catch (err) {
             console.error('[Compact] Error:', err);
             res.status(500).json({ error: err.message || 'Compaction failed' });
         }
+    });
+
+    // AskUserQuestion — receive user's answer and write back to engine stdin
+    server.post('/api/conversations/:id/answer', (req, res) => {
+        const { request_id, tool_use_id, answers } = req.body;
+        const child = activeChildren.get(req.params.id);
+        if (!child) return res.status(404).json({ error: 'No active engine process' });
+        if (!request_id) return res.status(400).json({ error: 'Missing request_id' });
+
+        const controlResponse = JSON.stringify({
+            type: 'control_response',
+            response: {
+                subtype: 'success',
+                request_id: request_id,
+                response: {
+                    toolUseID: tool_use_id || '',
+                    behavior: 'accept',
+                    message: null,
+                    answers: answers || {},
+                }
+            }
+        }) + '\n';
+
+        try {
+            child.stdin.write(controlResponse);
+            console.log('[AskUser] Answered request_id=' + request_id, JSON.stringify(answers || {}).slice(0, 200));
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('[AskUser] Write error:', err.message);
+            res.status(500).json({ error: 'Failed to write to engine stdin' });
+        }
+    });
+
+    // Stream status — check if a conversation has an active engine stream
+    server.get('/api/conversations/:id/stream-status', (req, res) => {
+        const stream = activeStreams.get(req.params.id);
+        res.json({ active: !!(stream && !stream.done), eventCount: stream ? stream.events.length : 0 });
+    });
+
+    // Reconnect to an active stream — sends all buffered events then continues live
+    server.get('/api/conversations/:id/reconnect', (req, res) => {
+        const stream = activeStreams.get(req.params.id);
+        if (!stream) return res.status(404).json({ error: 'No active stream' });
+
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+        });
+
+        // Send all buffered events
+        for (const event of stream.events) {
+            res.write('data: ' + JSON.stringify(event) + '\n\n');
+        }
+
+        if (stream.done) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return;
+        }
+
+        // Add to listeners for future events
+        stream.listeners.add(res);
+        req.on('close', () => stream.listeners.delete(res));
     });
 
     // ===== Skills =====
@@ -1060,7 +1219,25 @@ You have the following skills available. When a user's request matches a skill's
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        const sendSSE = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+        // Initialize stream buffer for this conversation
+        res.flushHeaders();
+        activeStreams.set(conversation_id, { events: [], listeners: new Set(), done: false, primaryRes: res });
+        const sendSSE = (data) => {
+            // Always write to primary response directly (original POST requester)
+            var stream = activeStreams.get(conversation_id);
+            if (stream) {
+                stream.events.push(data);
+                // Write to reconnect listeners
+                var line = 'data: ' + JSON.stringify(data) + '\n\n';
+                var arr = Array.from(stream.listeners);
+                for (var i = 0; i < arr.length; i++) {
+                    try { arr[i].write(line); } catch (_) { stream.listeners.delete(arr[i]); }
+                }
+            }
+            // Always write to the original POST response
+            try { res.write('data: ' + JSON.stringify(data) + '\n\n'); } catch (_) {}
+        };
 
         try {
             // ── 1. Handle attachments & detect images ──
@@ -1212,8 +1389,7 @@ You have the following skills available. When a user's request matches a skill's
                     generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model);
                 }
                 sendSSE({ type: 'message_stop' });
-                res.write('data: [DONE]\n\n');
-                res.end();
+                endStream(conversation_id);
                 return;
             }
 
@@ -1244,7 +1420,10 @@ You have the following skills available. When a user's request matches a skill's
                 cwd: conv.workspace_path, env: envVars,
                 stdio: ['pipe', 'pipe', 'pipe'],
             });
-            child.stdin.end();
+            // Keep stdin open for control_response (AskUserQuestion)
+            // Store child ref so the answer endpoint can write to it
+            const childRef = child;
+            activeChildren.set(conversation_id, childRef);
 
             // ── 5. Parse stream-json and forward to frontend ──
             let assistantText = '';
@@ -1252,11 +1431,12 @@ You have the following skills available. When a user's request matches a skill's
             const toolCalls = new Map();
             const sentToolStarts = new Set(); // track which tool_use_start we already sent
             const writtenFiles = new Map(); // deduplicate Write tool results by file path
+            const searchLogs = []; // collect WebSearch results for persistence
             let sessionId = conv.claude_session_id;
             let buf = '';
 
             // Tools that are internal to Claude Code and should not be shown to the user
-            const HIDDEN_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
+            const HIDDEN_TOOLS = new Set(['EnterWorktree', 'ExitWorktree', 'TodoWrite', 'WebSearch', 'WebFetch']);
 
             child.stdout.on('data', (chunk) => {
                 buf += chunk.toString('utf8');
@@ -1272,6 +1452,11 @@ You have the following skills available. When a user's request matches a skill's
                         sessionId = evt.session_id;
                         conv.claude_session_id = sessionId;
                         saveDb();
+                    }
+
+                    // Debug: log all event types to understand WebSearch flow
+                    if (evt.type !== 'stream_event') {
+                        console.log('[Engine-evt]', evt.type, evt.subtype || '', evt.tool_use_id ? 'tool_id=' + evt.tool_use_id : '', typeof evt.content === 'string' ? evt.content.slice(0, 100) : '');
                     }
 
                     if (evt.type === 'stream_event' && evt.event) {
@@ -1299,8 +1484,22 @@ You have the following skills available. When a user's request matches a skill's
                             if (block.type === 'tool_use') {
                                 var tc = toolCalls.get(block.id);
                                 if (tc) tc.input = block.input;
+                                // WebSearch: emit status event instead of tool_use_start
+                                if (block.name === 'WebSearch' && !sentToolStarts.has(block.id)) {
+                                    sentToolStarts.add(block.id);
+                                    var searchQuery = (block.input && block.input.query) || 'the web';
+                                    sendSSE({ type: 'status', message: 'Searching: ' + searchQuery });
+                                    console.log('[WebSearch] Started, query:', searchQuery, 'id:', block.id);
+                                }
+                                // WebFetch: also emit status
+                                else if (block.name === 'WebFetch' && !sentToolStarts.has(block.id)) {
+                                    sentToolStarts.add(block.id);
+                                    var fetchUrl = (block.input && block.input.url) || '';
+                                    sendSSE({ type: 'status', message: 'Fetching: ' + fetchUrl });
+                                    console.log('[WebFetch] Started, url:', fetchUrl);
+                                }
                                 // Send tool_use_start with full input (only once per tool)
-                                if (!sentToolStarts.has(block.id) && !HIDDEN_TOOLS.has(block.name)) {
+                                else if (!sentToolStarts.has(block.id) && !HIDDEN_TOOLS.has(block.name)) {
                                     sentToolStarts.add(block.id);
                                     sendSSE({ type: 'tool_use_start', tool_use_id: block.id, tool_name: block.name, tool_input: block.input });
                                     console.log('[Tool]', block.name, JSON.stringify(block.input || {}).slice(0, 120));
@@ -1308,13 +1507,76 @@ You have the following skills available. When a user's request matches a skill's
                             }
                         }
                     }
-                    // Tool result
+                    // User message with tool_use_result (WebSearch results come through here)
+                    else if (evt.type === 'user' && evt.message && evt.message.content) {
+                        var userContent = evt.message.content;
+                        var contentArr = Array.isArray(userContent) ? userContent : [];
+                        for (var ci = 0; ci < contentArr.length; ci++) {
+                            var cb = contentArr[ci];
+                            if (cb.type === 'tool_result' && cb.tool_use_id) {
+                                var tc3 = toolCalls.get(cb.tool_use_id);
+                                var tn = tc3 ? tc3.name : '';
+                                // Extract text from tool_result content
+                                var trText = '';
+                                if (typeof cb.content === 'string') trText = cb.content;
+                                else if (Array.isArray(cb.content)) trText = cb.content.map(function(x) { return x.text || ''; }).join('');
+                                if (tc3) { tc3.status = cb.is_error ? 'error' : 'done'; tc3.result = trText; }
+
+                                // WebSearch: parse result text and emit search_sources
+                                if (tn === 'WebSearch' && trText) {
+                                    console.log('[WebSearch] Result from user event:', trText.slice(0, 300));
+                                    try {
+                                        // Format: "Web search results for query: "..."\n\nLinks: [{...},...]\n\nContent:..."
+                                        var wsQuery = '';
+                                        var qMatch = trText.match(/query:\s*"([^"]+)"/);
+                                        if (qMatch) wsQuery = qMatch[1];
+                                        var wsSources = [];
+                                        var linksMatch = trText.match(/Links:\s*(\[[\s\S]*?\])\s*\n/);
+                                        if (linksMatch) {
+                                            try {
+                                                var links = JSON.parse(linksMatch[1]);
+                                                if (Array.isArray(links)) {
+                                                    wsSources = links.filter(function(l) { return l.url; }).map(function(l) { return { url: l.url, title: l.title || '' }; });
+                                                }
+                                            } catch (_) {}
+                                        }
+                                        if (wsSources.length > 0 && wsQuery) {
+                                            sendSSE({ type: 'search_sources', sources: wsSources, query: wsQuery });
+                                            searchLogs.push({ query: wsQuery, results: wsSources });
+                                            console.log('[WebSearch] Emitted', wsSources.length, 'sources for:', wsQuery);
+                                        }
+                                    } catch (_) {}
+                                }
+
+                                // Don't send tool_use_done for hidden tools
+                                if (!HIDDEN_TOOLS.has(tn)) {
+                                    sendSSE({ type: 'tool_use_done', tool_use_id: cb.tool_use_id, content: trText.slice(0, 50000), is_error: cb.is_error || false });
+                                }
+                            }
+                        }
+                    }
+                    // Tool result (legacy path)
                     else if (evt.type === 'tool') {
                         var resultText = typeof evt.content === 'string' ? evt.content
                             : Array.isArray(evt.content) ? evt.content.map(function(b) { return b.text || ''; }).join('') : '';
                         var tc2 = toolCalls.get(evt.tool_use_id);
                         var toolName = tc2 ? tc2.name : '';
                         if (tc2) { tc2.status = evt.is_error ? 'error' : 'done'; tc2.result = resultText; }
+
+                        // WebSearch result (legacy tool path): parse text format
+                        if (toolName === 'WebSearch' && resultText) {
+                            try {
+                                var qm2 = resultText.match(/query:\s*"([^"]+)"/);
+                                var lm2 = resultText.match(/Links:\s*(\[[\s\S]*?\])\s*\n/);
+                                if (qm2 && lm2) {
+                                    var links2 = JSON.parse(lm2[1]);
+                                    var sources = links2.filter(function(l) { return l.url; }).map(function(l) { return { url: l.url, title: l.title || '' }; });
+                                    if (sources.length > 0) {
+                                        sendSSE({ type: 'search_sources', sources: sources, query: qm2[1] });
+                                    }
+                                }
+                            } catch (_) {}
+                        }
 
                         // Deduplicate Write tool: only keep last version per file path
                         if (toolName === 'Write' && tc2 && tc2.input && tc2.input.file_path) {
@@ -1335,6 +1597,43 @@ You have the following skills available. When a user's request matches a skill's
                     else if (evt.type === 'result' && !assistantText && evt.result) {
                         assistantText = typeof evt.result === 'string' ? evt.result : '';
                     }
+                    // AskUserQuestion — engine needs user input via control_request
+                    else if (evt.type === 'control_request' && evt.request) {
+                        var req2 = evt.request;
+                        if (req2.subtype === 'can_use_tool' && req2.tool_name === 'AskUserQuestion') {
+                            console.log('[AskUser] control_request id=' + evt.request_id);
+                            sendSSE({
+                                type: 'ask_user',
+                                request_id: evt.request_id,
+                                tool_use_id: req2.tool_use_id,
+                                questions: (req2.input && req2.input.questions) || [],
+                            });
+                        } else {
+                            // Other permission requests — auto-accept in bypass mode
+                            var autoResponse = JSON.stringify({
+                                type: 'control_response',
+                                response: { subtype: 'success', request_id: evt.request_id, response: { toolUseID: req2.tool_use_id, behavior: 'accept', message: null } }
+                            }) + '\n';
+                            try { childRef.stdin.write(autoResponse); } catch (_) {}
+                        }
+                    }
+                    // Task/Agent progress events
+                    else if (evt.type === 'system' && (evt.subtype === 'task_started' || evt.subtype === 'task_progress' || evt.subtype === 'task_notification')) {
+                        sendSSE({ type: 'task_event', subtype: evt.subtype, task_id: evt.task_id, description: evt.description, status: evt.status, summary: evt.summary, usage: evt.usage, last_tool_name: evt.last_tool_name });
+                    }
+                    // Auto-compact boundary — engine compacted context mid-conversation
+                    else if (evt.type === 'system' && evt.subtype === 'compact_boundary') {
+                        var meta = evt.compact_metadata || {};
+                        console.log('[AutoCompact] Engine auto-compacted context, pre_tokens=' + (meta.pre_tokens || '?'));
+                        sendSSE({ type: 'compact_boundary', compact_metadata: meta });
+                        // Append a compact boundary marker — keep old messages for UI display
+                        db.messages.push({
+                            id: uuidv4(), conversation_id: conversation_id, role: 'system',
+                            content: JSON.stringify([{ type: 'text', text: 'Context auto-compacted by engine.' }]),
+                            created_at: new Date().toISOString(), is_compact_boundary: true,
+                        });
+                        saveDb();
+                    }
                 }
             });
 
@@ -1343,11 +1642,12 @@ You have the following skills available. When a user's request matches a skill's
 
             await new Promise(function(resolve, reject) {
                 child.on('close', function(code) {
+                    activeChildren.delete(conversation_id);
                     if (buf.trim()) { try { var e = JSON.parse(buf); if (!assistantText && e.result) assistantText = typeof e.result === 'string' ? e.result : ''; } catch(x) {} }
                     if (code !== 0 && !assistantText) reject(new Error(stderrBuf || 'Engine exit ' + code));
                     else resolve();
                 });
-                child.on('error', reject);
+                child.on('error', function(err) { activeChildren.delete(conversation_id); reject(err); });
             });
 
             // ── 6. Save results ──
@@ -1357,19 +1657,19 @@ You have the following skills available. When a user's request matches a skill's
                     content: JSON.stringify([{ type: 'text', text: assistantText }]),
                     created_at: new Date().toISOString(),
                     thinking: thinkingText || undefined,
-                    toolCalls: toolCalls.size > 0 ? Array.from(toolCalls.values()) : undefined
+                    toolCalls: toolCalls.size > 0 ? Array.from(toolCalls.values()) : undefined,
+                    searchLogs: searchLogs.length > 0 ? searchLogs : undefined,
                 });
                 saveDb();
                 generateTitleAsync(conversation_id, message.slice(0, 300), assistantText.slice(0, 300), apiKey, baseUrl, conv.model);
             }
 
             sendSSE({ type: 'message_stop' });
-            res.write('data: [DONE]\n\n');
-            res.end();
+            endStream(conversation_id);
         } catch (err) {
             console.error('[Chat] Error:', (err.message || '').slice(0, 300));
             sendSSE({ type: 'error', error: err.message || 'Engine error' });
-            res.end();
+            endStream(conversation_id);
         }
     });
 

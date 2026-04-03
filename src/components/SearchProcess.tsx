@@ -52,7 +52,7 @@ const SearchLogItem: React.FC<{ log: SearchLog; defaultOpen?: boolean }> = ({ lo
   return (
     <div className="relative pl-8 pb-2">
       {/* Node Icon */}
-      <div className="absolute left-0 top-0.5 z-10 bg-[#FAF9F5] text-claude-textSecondary">
+      <div className="absolute left-0 top-0.5 z-10 bg-claude-bg text-claude-textSecondary">
         <Globe size={16} />
       </div>
       
@@ -73,22 +73,22 @@ const SearchLogItem: React.FC<{ log: SearchLog; defaultOpen?: boolean }> = ({ lo
       </div>
 
       {isOpen && (
-        <div className="bg-[#F9F9F8] border border-[#E5E5E5] rounded-xl overflow-hidden shadow-sm mt-1">
+        <div className="bg-claude-bgSecondary border border-claude-border rounded-xl overflow-hidden shadow-sm mt-1">
           <div className="max-h-[180px] overflow-y-auto overflow-x-hidden custom-scrollbar">
             {log.results.map((result, rIndex) => (
-              <a 
+              <a
                 key={rIndex}
                 href={result.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-[#F0F0EE] transition-colors no-underline group border-b border-[#F0F0EE] last:border-b-0"
+                className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-claude-hover transition-colors no-underline group border-b border-black/5 dark:border-white/5 last:border-b-0"
               >
                 <Favicon url={result.url} />
                 <div className="flex-1 min-w-0 flex items-center gap-2">
-                  <span className="text-[12px] text-[#333] font-medium truncate max-w-[70%] transition-colors">
+                  <span className="text-[12px] text-claude-text font-medium truncate max-w-[70%] transition-colors">
                     {result.title || result.url}
                   </span>
-                  <span className="text-[11px] text-[#888] truncate flex-shrink-0">
+                  <span className="text-[11px] text-claude-textSecondary truncate flex-shrink-0">
                     {new URL(result.url).hostname}
                   </span>
                 </div>
@@ -148,13 +148,13 @@ const SearchProcess: React.FC<SearchProcessProps> = ({ logs, isThinking, isDone 
 
           {!isThinking && (
             <div className="relative pl-8 pt-1 pb-1">
-              <div className="absolute left-0 top-1 z-10 bg-[#FAF9F5] text-claude-textSecondary">
+              <div className="absolute left-0 top-1 z-10 bg-claude-bg text-claude-textSecondary">
                 <Check size={16} />
               </div>
               <div className="flex items-center gap-2 text-claude-textSecondary">
                 <span className="text-[13px]">Done</span>
                 {totalTokens > 0 && (
-                  <span className="text-[11px] text-[#888]">· {totalTokens.toLocaleString()} tokens</span>
+                  <span className="text-[11px] text-claude-textSecondary">· {totalTokens.toLocaleString()} tokens</span>
                 )}
               </div>
             </div>

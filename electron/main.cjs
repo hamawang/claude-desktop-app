@@ -95,6 +95,20 @@ function createWindow() {
         mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
     }
 
+    // Open all external links in the system browser, not in the app
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+            shell.openExternal(url);
+        }
+        return { action: 'deny' };
+    });
+    mainWindow.webContents.on('will-navigate', (event, url) => {
+        // Allow hash navigation (file:// with #) and localhost dev server
+        if (url.startsWith('file://') || url.startsWith('http://localhost')) return;
+        event.preventDefault();
+        shell.openExternal(url);
+    });
+
     mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
         if (level >= 2) {
             try { require('fs').appendFileSync(require('path').join(require('electron').app.getPath('userData'), 'frontend-error.log'), `[Frontend Error] ${message} at ${sourceId}:${line}\n`); } catch (_) {}
